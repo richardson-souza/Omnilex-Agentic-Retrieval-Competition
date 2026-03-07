@@ -1,141 +1,99 @@
-#!/usr/bin/env python3
-"""Build BM25 indices for legal document corpora.
-
-Creates searchable indices for:
-1. Federal laws (SR corpus)
-2. Court decisions (BGE corpus)
-
-Usage:
-    python scripts/build_indices.py
-    python scripts/build_indices.py --input-dir ./data/raw --output-dir ./data/processed
-"""
-
 import argparse
 import sys
+import os
+import pandas as pd
 from pathlib import Path
+from typing import List, Dict, Any
 
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from omnilex.retrieval.bm25_index import BM25Index, load_jsonl_corpus
+from omnilex.retrieval.dense_index import DenseIndex
 
 
-def build_laws_index(input_dir: Path, output_dir: Path) -> None:
-    """Build BM25 index for federal laws corpus.
+def load_corpus(file_path: Path) -> List[Dict[str, Any]]:
+    """Load corpus from either JSONL or CSV."""
+    if not file_path.exists():
+        return []
 
-    Args:
-        input_dir: Directory containing raw corpus files
-        output_dir: Directory to save index
-    """
-    print("Building federal laws index...")
+    print(f"  Loading corpus from {file_path}...")
+    if file_path.suffix == ".jsonl":
+        return load_jsonl_corpus(file_path)
+    elif file_path.suffix == ".csv":
+        df = pd.read_csv(file_path)
+        # Ensure required columns exist
+        if "citation" not in df.columns or "text" not in df.columns:
+            print(f"  Warning: CSV {file_path} missing 'citation' or 'text' columns.")
+            return []
+        return df.to_dict("records")
+    return []
 
-    # Try to find laws corpus file
-    possible_paths = [
-        input_dir / "samples" / "federal_laws.jsonl",
-        input_dir / "federal_laws.jsonl",
-        input_dir / "laws" / "federal_laws.jsonl",
-        input_dir / "corpus" / "laws.jsonl",
-    ]
 
-    corpus_path = None
-    for path in possible_paths:
-        if path.exists():
-            corpus_path = path
+def build_hybrid_index(
+    input_dir: Path, output_dir: Path, model_name: str, limit: int = None
+) -> None:
+    """Build both BM25 and Dense indices for the full corpus."""
+    print("Building hybrid index for COMPLETE corpus...")
+
+    documents = []
+
+    # 1. Load Laws (Prioritize full corpus over samples)
+    laws_found = False
+    for name in ["laws_de.csv", "federal_laws.jsonl", "samples/federal_laws.jsonl"]:
+        path = input_dir / name
+        docs = load_corpus(path)
+        if docs:
+            print(f"  Loaded {len(docs)} documents from {name}")
+            documents.extend(docs)
+            laws_found = True
             break
 
-    if corpus_path is None:
-        print("  Warning: No federal laws corpus found. Skipping index build.")
-        print(f"  Expected one of: {[str(p) for p in possible_paths]}")
-        return
-
-    # Load corpus
-    print(f"  Loading corpus from {corpus_path}")
-    documents = load_jsonl_corpus(corpus_path)
-    print(f"  Loaded {len(documents)} documents")
-
-    if len(documents) == 0:
-        print("  Warning: Empty corpus. Skipping index build.")
-        return
-
-    # Build index
-    index = BM25Index(
-        documents=documents,
-        text_field="text",
-        citation_field="citation",
-    )
-
-    # Save index
-    output_path = output_dir / "laws_index.pkl"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    index.save(output_path)
-
-    print(f"  Index saved to {output_path}")
-
-    # Test search
-    test_query = "Vertrag"
-    results = index.search(test_query, top_k=3)
-    print(f"  Test search for '{test_query}': {len(results)} results")
-
-
-def build_courts_index(input_dir: Path, output_dir: Path) -> None:
-    """Build BM25 index for court decisions corpus.
-
-    Args:
-        input_dir: Directory containing raw corpus files
-        output_dir: Directory to save index
-    """
-    print("\nBuilding court decisions index...")
-
-    # Try to find courts corpus file
-    possible_paths = [
-        input_dir / "samples" / "court_decisions.jsonl",
-        input_dir / "court_decisions.jsonl",
-        input_dir / "courts" / "bge.jsonl",
-        input_dir / "corpus" / "courts.jsonl",
-    ]
-
-    corpus_path = None
-    for path in possible_paths:
-        if path.exists():
-            corpus_path = path
+    # 2. Load Courts (Prioritize full corpus over samples)
+    courts_found = False
+    for name in [
+        "court_considerations.csv",
+        "court_decisions.jsonl",
+        "samples/court_decisions.jsonl",
+    ]:
+        path = input_dir / name
+        docs = load_corpus(path)
+        if docs:
+            print(f"  Loaded {len(docs)} documents from {name}")
+            documents.extend(docs)
+            courts_found = True
             break
 
-    if corpus_path is None:
-        print("  Warning: No court decisions corpus found. Skipping index build.")
-        print(f"  Expected one of: {[str(p) for p in possible_paths]}")
+    if not documents:
+        print("  Error: No corpus files found. Skipping index build.")
         return
 
-    # Load corpus
-    print(f"  Loading corpus from {corpus_path}")
-    documents = load_jsonl_corpus(corpus_path)
-    print(f"  Loaded {len(documents)} documents")
+    if limit:
+        print(f"  Limiting to first {limit} documents for local testing.")
+        documents = documents[:limit]
 
-    if len(documents) == 0:
-        print("  Warning: Empty corpus. Skipping index build.")
-        return
+    print(f"  Total documents to index: {len(documents)}")
 
-    # Build index
-    index = BM25Index(
-        documents=documents,
-        text_field="text",
-        citation_field="citation",
+    # 1. Build BM25 Index
+    print("  Building BM25 Index (Sparse)...")
+    bm25_idx = BM25Index(documents=documents, text_field="text", citation_field="citation")
+    bm25_path = output_dir / "corpus_bm25.pkl"
+    bm25_idx.save(bm25_path)
+    print(f"  BM25 Index saved to {bm25_path}")
+
+    # 2. Build Dense Index
+    print(f"  Building Dense Index (FAISS + {model_name})...")
+    # Note: On local machine with 2GB VRAM, this might need small batch_size
+    dense_idx = DenseIndex(
+        model_name=model_name, documents=documents, text_field="text", citation_field="citation"
     )
-
-    # Save index
-    output_path = output_dir / "courts_index.pkl"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    index.save(output_path)
-
-    print(f"  Index saved to {output_path}")
-
-    # Test search
-    test_query = "Meinungsfreiheit"
-    results = index.search(test_query, top_k=3)
-    print(f"  Test search for '{test_query}': {len(results)} results")
+    dense_prefix = output_dir / "corpus_dense"
+    dense_idx.save(dense_prefix)
+    print(f"  Dense Index saved to {dense_prefix}.index and .pkl")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build BM25 indices for legal corpora")
+    parser = argparse.ArgumentParser(description="Build hybrid indices for legal corpora")
     parser.add_argument(
         "--input-dir",
         type=Path,
@@ -149,26 +107,23 @@ def main():
         help="Output directory for indices",
     )
     parser.add_argument(
-        "--laws-only",
-        action="store_true",
-        help="Only build laws index",
+        "--model-name",
+        type=str,
+        default="sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+        help="Sentence transformer model for dense indexing",
     )
     parser.add_argument(
-        "--courts-only",
-        action="store_true",
-        help="Only build courts index",
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit number of documents for testing",
     )
 
     args = parser.parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    # Build indices
-    if not args.courts_only:
-        build_laws_index(args.input_dir, args.output_dir)
-
-    if not args.laws_only:
-        build_courts_index(args.input_dir, args.output_dir)
-
-    print("\nIndex building complete!")
+    build_hybrid_index(args.input_dir, args.output_dir, args.model_name, args.limit)
+    print("\nHybrid index building complete!")
 
 
 if __name__ == "__main__":

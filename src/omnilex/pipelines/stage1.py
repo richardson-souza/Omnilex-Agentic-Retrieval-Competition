@@ -5,6 +5,9 @@ from ..data.cv_setup import setup_cv
 from ..data.oof_generation import generate_oof_predictions
 from ..data.threshold_optimization import optimize_threshold
 from ..data.translation import apply_translation_pipeline
+from ..retrieval.bm25_index import BM25Index
+from ..retrieval.dense_index import DenseIndex
+from ..retrieval.hybrid import HybridSearchEngine
 
 
 def run_stage2_feature_engineering(
@@ -38,31 +41,20 @@ def run_stage2_feature_engineering(
 
 def run_stage1_pipeline(
     train_df: pd.DataFrame,
-    search_engine,
+    search_engine=None,  # Optional if we load from files
     n_splits: int = 5,
     seed: int = 42,
-    top_k: int = 50,
+    top_k: int = 100,
     output_dir: str = "data/processed",
     skip_translation: bool = False,
+    skip_indexing: bool = True,
+    model_name: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
 ):
     """
-    Orchestrate Stage 1 & 2 of the competition pipeline.
-
-    Args:
-        train_df: Original training DataFrame.
-        search_engine: Search engine instance for retrieval.
-        n_splits: Number of folds for CV.
-        seed: Random seed.
-        top_k: Top K candidates to retrieve during OOF generation.
-        output_dir: Directory to save the intermediate DataFrames.
-        skip_translation: If True, uses 'query' column. If False, translates and uses 'query_de'.
-
-    Returns:
-        optimal_threshold (T*).
+    Orchestrate Stage 1, 2 & 3 of the competition pipeline.
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Helper function to save DataFrames preferring Parquet
     def save_df(df, name):
         parquet_path = os.path.join(output_dir, f"{name}.parquet")
         try:
@@ -74,17 +66,13 @@ def run_stage1_pipeline(
             return csv_path
 
     # Fase 1: Preparação do CV
-    # 1. Target Engineering
     print("Step 1: Creating cardinality bins...")
     train_df_binned = create_cardinality_bins(train_df, n_splits=n_splits)
-    path1 = save_df(train_df_binned, "train_binned")
-    print(f"Saved to {path1}")
+    save_df(train_df_binned, "train_binned")
 
-    # 2. CV Setup
     print("Step 2: Setting up CV folds...")
     train_df_cv = setup_cv(train_df_binned, n_splits=n_splits, seed=seed)
-    path2 = save_df(train_df_cv, "train_cv")
-    print(f"Saved to {path2}")
+    save_df(train_df_cv, "train_cv")
 
     # Fase 2: Feature Engineering (Tradução)
     query_col = "query"
@@ -92,22 +80,42 @@ def run_stage1_pipeline(
         print("Step 2.5: Translating queries (Feature Engineering)...")
         train_df_cv = run_stage2_feature_engineering(train_df_cv, output_dir=output_dir)
         query_col = "query_de"
+    elif os.path.exists(os.path.join(output_dir, "train_cv_translated.parquet")):
+        print("Loading existing translated queries...")
+        train_df_cv = pd.read_parquet(os.path.join(output_dir, "train_cv_translated.parquet"))
+        query_col = "query_de"
 
-    # Fase 3: Inferência OOF (Translingual if translated)
-    # 3. generate_oof_predictions
-    print(f"Step 3: Generating OOF predictions (top_k={top_k}, using {query_col})...")
+    # Fase 3: Model Architecture (Retrieval Híbrido)
+    if search_engine is None:
+        print("Step 3: Initializing Hybrid Search Engine...")
+        bm25_path = os.path.join(output_dir, "corpus_bm25.pkl")
+        dense_prefix = os.path.join(output_dir, "corpus_dense")
 
+        if not os.path.exists(bm25_path) or not os.path.exists(dense_prefix + ".index"):
+            if skip_indexing:
+                raise FileNotFoundError("Indices not found and skip_indexing is True.")
+            # Build indices (import build_hybrid_index here to avoid circular imports if any)
+            from ...utils.build_indices import build_hybrid_index
+
+            build_hybrid_index(Path("data/raw"), Path(output_dir), model_name)
+
+        print("  Loading BM25 index...")
+        bm25_idx = BM25Index.load(bm25_path)
+        print("  Loading Dense index...")
+        dense_idx = DenseIndex.load(dense_prefix)
+        search_engine = HybridSearchEngine(bm25_idx, dense_idx)
+
+    # Fase 3B: Inferência OOF (Translingual)
+    print(f"Step 3B: Generating OOF predictions (top_k={top_k}, using {query_col})...")
     df_for_oof = train_df_cv.copy()
     if query_col != "query":
         df_for_oof["query_original"] = df_for_oof["query"]
         df_for_oof["query"] = df_for_oof[query_col]
 
     oof_df = generate_oof_predictions(df_for_oof, search_engine, top_k=top_k)
-    path3 = save_df(oof_df, "oof_predictions")
-    print(f"Saved to {path3}")
+    save_df(oof_df, "oof_predictions")
 
     # Fase 4: Calibração Numérica
-    # 4. optimize_threshold
     print("Step 4: Optimizing threshold...")
     optimal_threshold = optimize_threshold(oof_df, train_df_cv, verbose=True)
 
