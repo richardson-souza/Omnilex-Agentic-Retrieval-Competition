@@ -2,14 +2,17 @@ import os
 import re
 import pandas as pd
 from tqdm.auto import tqdm
+import gc
 
 try:
     import torch
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
     from torch.utils.data import DataLoader
+
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
+
     # Define placeholder classes for type hints or simple mocking in tests
     class MagicMockPlaceholder:
         def __getattr__(self, name):
@@ -27,20 +30,27 @@ except ImportError:
 
 def load_translation_model(model_name: str = "facebook/nllb-200-distilled-600M"):
     """
-    Etapa 2.1: Inicialização Otimizada do Modelo de Tradução.
-    Loads the NLLB model in FP16 for optimized inference.
+    Etapa 2.1: Inicialização Otimizada com Quantização INT8.
+    Optimized for hardware with severe VRAM constraints (e.g., MX150 2GB).
+    Requires 'bitsandbytes' and 'accelerate'.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Carregamento do Tokenizador
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    # Carregamento Otimizado do Modelo em FP16
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-    ).to(device)
+    # Carregamento Otimizado em INT8 (~600MB VRAM)
+    if device.type == "cuda":
+        print(f"Loading {model_name} in INT8 mode for GPU: {torch.cuda.get_device_name(0)}")
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_name,
+            load_in_8bit=True,  # LLM.int8() compression
+            device_map="auto",  # Automatic device placement
+            low_cpu_mem_usage=True,
+        )
+    else:
+        # Fallback for CPU (cannot use 8bit quantization easily without specialized libs)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name, low_cpu_mem_usage=True).to(device)
 
     model.eval()  # Congela pesos, desliga Dropout
 
@@ -53,11 +63,11 @@ def batch_translate(
     model,
     device,
     target_lang: str = "deu_Latn",
-    batch_size: int = 32,
+    batch_size: int = 4,  # Aggressive reduction for low-VRAM GPUs (e.g., MX150)
 ) -> list[str]:
     """
     Etapa 2.2: Inferência em Lotes (Batch Processing) e Geração.
-    Translates a list of queries using batching and inference_mode.
+    Uses micro-batches and aggressive GC to prevent OOM.
     """
     # NLLB exige o ID do idioma alvo para forçar o output do Decoder
     forced_bos_token_id = tokenizer.lang_code_to_id[target_lang]
@@ -75,7 +85,7 @@ def batch_translate(
                 batch, return_tensors="pt", padding=True, truncation=True, max_length=128
             ).to(device)
 
-            # Geração com num_beams=1 (Greedy Search) para máxima velocidade
+            # Geração com num_beams=1 (Greedy Search) para máxima velocidade e mínima VRAM
             generated_tokens = model.generate(
                 **inputs, forced_bos_token_id=forced_bos_token_id, max_length=128, num_beams=1
             )
@@ -83,6 +93,12 @@ def batch_translate(
             # Decodificação em CPU
             decoded_batch = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
             translated_queries.extend(decoded_batch)
+
+            # Coleta de lixo agressiva no loop de microbatch para evitar memory spikes
+            if device.type == "cuda":
+                del inputs, generated_tokens
+                torch.cuda.empty_cache()
+                gc.collect()
 
     return translated_queries
 
@@ -103,7 +119,7 @@ def apply_translation_pipeline(
     df: pd.DataFrame,
     text_column: str = "query",
     target_lang: str = "deu_Latn",
-    batch_size: int = 32,
+    batch_size: int = 4,  # Micro-batches safe for MX150
 ) -> pd.DataFrame:
     """
     Orchestrates the translation of a DataFrame's text column.
@@ -121,11 +137,11 @@ def apply_translation_pipeline(
     )
 
     # Otimização de RAM: Libertar a VRAM imediatamente após o uso da tradução
-    # Isso ocorre antes da sanitização para garantir que os estágios seguintes tenham VRAM livre
     del model
     del tokenizer
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    gc.collect()
 
     # Etapa 2.3: Sanitização
     df[f"{text_column}_de"] = [sanitize_legal_terms(q) for q in queries_translated]
