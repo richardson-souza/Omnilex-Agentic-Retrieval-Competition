@@ -1,242 +1,116 @@
-"""BM25 indexing and search for legal document corpora."""
+"""Memory-efficient BM25 indexing using Scipy Sparse Matrices."""
 
-import json
 import pickle
-import re
+import numpy as np
+import scipy.sparse as sp
+from sklearn.feature_extraction.text import CountVectorizer
 from pathlib import Path
-
-from rank_bm25 import BM25Okapi
+from typing import List, Dict, Any, Optional
 
 
 class BM25Index:
-    """BM25 index for keyword search over legal documents.
-
-    Supports Swiss federal laws (SR) and court decisions (BGE).
-    """
+    """Memory-efficient BM25 index for large-scale legal corpora."""
 
     def __init__(
         self,
-        documents: list[dict] | None = None,
-        text_field: str = "text",
+        k1: float = 1.5,
+        b: float = 0.75,
         citation_field: str = "citation",
     ):
-        """Initialize BM25 index.
-
-        Args:
-            documents: List of document dictionaries
-            text_field: Key for document text in dict
-            citation_field: Key for citation string in dict
-        """
-        self.text_field = text_field
+        self.k1 = k1
+        self.b = b
         self.citation_field = citation_field
 
-        self.documents: list[dict] = []
-        self.index: BM25Okapi | None = None
-        self._tokenized_corpus: list[list[str]] = []
+        self.vectorizer = CountVectorizer(lowercase=True, token_pattern=r"(?u)\b\w\w+\b")
+        self.citations: List[str] = []
+        self.tf_matrix: Optional[sp.csr_matrix] = None
+        self.doc_lens: Optional[np.ndarray] = None
+        self.idf: Optional[np.ndarray] = None
+        self.avgdl: float = 0.0
 
-        if documents:
-            self.build(documents)
+    def build(self, texts: List[str], citations: List[str]) -> None:
+        """Build index using sparse matrices."""
+        print(f"  Tokenizing and building sparse matrix for {len(texts)} docs...")
+        self.citations = citations
 
-    def tokenize(self, text: str) -> list[str]:
-        """Tokenize text for BM25 indexing.
+        # 1. Fit and transform texts to count matrix
+        self.tf_matrix = self.vectorizer.fit_transform(texts)
 
-        Simple whitespace + lowercase tokenization.
-        Can be overridden for language-specific tokenization.
+        # 2. Precompute stats
+        self.doc_lens = np.array(self.tf_matrix.sum(axis=1)).flatten()
+        self.avgdl = self.doc_lens.mean()
 
-        Args:
-            text: Text to tokenize
+        # 3. Compute IDF
+        n_docs = self.tf_matrix.shape[0]
+        # Number of docs containing each term (column-wise non-zero counts)
+        doc_freqs = np.array((self.tf_matrix > 0).sum(axis=0)).flatten()
+        self.idf = np.log((n_docs - doc_freqs + 0.5) / (doc_freqs + 0.5) + 1.0)
 
-        Returns:
-            List of tokens
-        """
-        # Lowercase and split on non-alphanumeric characters
-        text = text.lower()
-        tokens = re.split(r"\W+", text)
-        # Filter empty tokens
-        return [t for t in tokens if t]
-
-    def build(self, documents: list[dict]) -> None:
-        """Build BM25 index from documents.
-
-        Args:
-            documents: List of document dictionaries
-        """
-        self.documents = documents
-
-        # Tokenize all documents
-        self._tokenized_corpus = []
-        for doc in documents:
-            text = doc.get(self.text_field, "")
-            tokens = self.tokenize(text)
-            self._tokenized_corpus.append(tokens)
-
-        # Build BM25 index
-        self.index = BM25Okapi(self._tokenized_corpus)
+        print(f"  Index built. Vocabulary size: {len(self.vectorizer.vocabulary_)}")
 
     def search(
-        self,
-        query: str,
-        top_k: int = 10,
-        return_scores: bool = False,
-    ) -> list[dict]:
-        """Search the index with a query.
+        self, query: str, top_k: int = 10, return_scores: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Fast vectorized BM25 search."""
+        if self.tf_matrix is None:
+            raise ValueError("Index not built.")
 
-        Args:
-            query: Search query string
-            top_k: Number of results to return
-            return_scores: Whether to include BM25 scores in results
-
-        Returns:
-            List of matching documents (with optional scores)
-        """
-        if self.index is None:
-            raise ValueError("Index not built. Call build() first.")
-
-        # Tokenize query
-        query_tokens = self.tokenize(query)
-
-        if not query_tokens:
+        query_vec = self.vectorizer.transform([query])
+        if query_vec.nnz == 0:
             return []
 
-        # Get BM25 scores
-        scores = self.index.get_scores(query_tokens)
+        # Get relevant columns from tf_matrix
+        q_indices = query_vec.indices
+        tf = self.tf_matrix[:, q_indices].toarray()
 
-        # Get top-k indices
-        top_indices = scores.argsort()[-top_k:][::-1]
+        # Apply BM25 formula to relevant terms
+        # score = idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * doc_len / avgdl))
+        num = tf * (self.k1 + 1)
+        denom = tf + self.k1 * (1 - self.b + self.b * self.doc_lens[:, None] / self.avgdl)
 
-        # Build results
+        # Weight by IDF and sum across terms
+        scores = (self.idf[q_indices] * (num / denom)).sum(axis=1)
+
+        # Get top-k
+        top_indices = np.argsort(scores)[-top_k:][::-1]
+
         results = []
         for idx in top_indices:
             if scores[idx] <= 0:
                 continue
-
-            doc = self.documents[idx].copy()
+            res = {"citation": self.citations[idx]}
             if return_scores:
-                doc["_score"] = float(scores[idx])
-            results.append(doc)
+                res["_score"] = float(scores[idx])
+            results.append(res)
 
         return results
 
     def save(self, path: Path | str) -> None:
-        """Save index to disk.
-
-        Args:
-            path: Path to save index (creates .pkl file)
-        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-
-        data = {
-            "documents": self.documents,
-            "tokenized_corpus": self._tokenized_corpus,
-            "text_field": self.text_field,
-            "citation_field": self.citation_field,
-        }
-
         with open(path, "wb") as f:
-            pickle.dump(data, f)
+            pickle.dump(
+                {
+                    "citations": self.citations,
+                    "tf_matrix": self.tf_matrix,
+                    "doc_lens": self.doc_lens,
+                    "avgdl": self.avgdl,
+                    "idf": self.idf,
+                    "vectorizer": self.vectorizer,
+                    "citation_field": self.citation_field,
+                },
+                f,
+            )
 
     @classmethod
     def load(cls, path: Path | str) -> "BM25Index":
-        """Load index from disk.
-
-        Args:
-            path: Path to saved index
-
-        Returns:
-            Loaded BM25Index instance
-        """
-        path = Path(path)
-
         with open(path, "rb") as f:
             data = pickle.load(f)
-
-        instance = cls(
-            text_field=data["text_field"],
-            citation_field=data.get("citation_field", "citation"),
-        )
-        instance.documents = data["documents"]
-        instance._tokenized_corpus = data["tokenized_corpus"]
-        instance.index = BM25Okapi(instance._tokenized_corpus)
-
+        instance = cls(citation_field=data["citation_field"])
+        instance.citations = data["citations"]
+        instance.tf_matrix = data["tf_matrix"]
+        instance.doc_lens = data["doc_lens"]
+        instance.avgdl = data["avgdl"]
+        instance.idf = data["idf"]
+        instance.vectorizer = data["vectorizer"]
         return instance
-
-
-def build_index(
-    documents: list[dict],
-    text_field: str = "text",
-    citation_field: str = "citation",
-) -> BM25Index:
-    """Build a BM25 index from documents.
-
-    Convenience function for quick index creation.
-
-    Args:
-        documents: List of document dictionaries
-        text_field: Key for document text
-        citation_field: Key for citation string
-
-    Returns:
-        Built BM25Index
-    """
-    return BM25Index(
-        documents=documents,
-        text_field=text_field,
-        citation_field=citation_field,
-    )
-
-
-def search(
-    index: BM25Index,
-    query: str,
-    top_k: int = 10,
-) -> list[dict]:
-    """Search an index with a query.
-
-    Convenience function for quick search.
-
-    Args:
-        index: BM25Index to search
-        query: Search query string
-        top_k: Number of results
-
-    Returns:
-        List of matching documents
-    """
-    return index.search(query, top_k=top_k)
-
-
-def load_jsonl_corpus(path: Path | str) -> list[dict]:
-    """Load a corpus from a JSONL file.
-
-    Args:
-        path: Path to JSONL file
-
-    Returns:
-        List of document dictionaries
-    """
-    path = Path(path)
-    documents = []
-
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                documents.append(json.loads(line))
-
-    return documents
-
-
-def save_jsonl_corpus(documents: list[dict], path: Path | str) -> None:
-    """Save a corpus to a JSONL file.
-
-    Args:
-        documents: List of document dictionaries
-        path: Path to save JSONL file
-    """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(path, "w", encoding="utf-8") as f:
-        for doc in documents:
-            f.write(json.dumps(doc, ensure_ascii=False) + "\n")
