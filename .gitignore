@@ -212,7 +212,7 @@ CLAUDE.md
 
 # Competition data files
 # Data directories (large datasets)
-data/
+data/*
 output/
 
 # Large data files (indices, corpora)
@@ -224,3 +224,7 @@ output/
 models/
 *.gguf
 *.bin
+
+req_*
+TDD_ETAPAS*
+.vscode/launch.json

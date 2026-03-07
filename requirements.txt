@@ -13,6 +13,7 @@ rank-bm25>=0.2.2
 # Data
 datasets>=2.14.0
 huggingface-hub>=0.17.0
+pyarrow>=12.0.0
 
 # Evaluation
 scikit-learn>=1.3.0

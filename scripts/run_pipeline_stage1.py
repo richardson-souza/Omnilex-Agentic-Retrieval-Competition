@@ -29,6 +29,19 @@ def main():
     seed = 42
     top_k = 50
 
+    # Set to True if you don't have GPU/torch installed
+    try:
+        import torch
+
+        HAS_TORCH = True
+        print(f"PyTorch detectou a GPU? {torch.cuda.is_available()}")
+        print(f"Nome: {torch.cuda.get_device_name(0)}")
+        print(f"Memória Total: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    except ImportError:
+        HAS_TORCH = False
+
+    skip_translation = not HAS_TORCH
+
     # 1. Load training data
     if not os.path.exists(train_path):
         print(f"Error: {train_path} not found. Please ensure data is downloaded.")
@@ -37,31 +50,32 @@ def main():
     print(f"Loading data from {train_path}...")
     train_df = pd.read_csv(train_path)
 
-    # 2. Setup Search Engine (using real BM25 with sample laws for demo or all if available)
-    # In a real scenario, we would load the full corpus.
-    # For Stage 1 orchestration demonstration, we'll use a mock or sample if full corpus is not indexed yet.
+    # 2. Setup Search Engine
     print("Initializing BM25 Search Engine...")
     # NOTE: In a real run, we'd load documents from data/processed/ or similar.
-    # Here we use SAMPLE_LAWS just to ensure the script can execute.
     index = BM25Index(SAMPLE_LAWS)
     tool = LawSearchTool(index)
     engine = SearchEngineAdapter(tool)
 
     # 3. Run Pipeline
-    print("Starting Stage 1 Pipeline (TE -> CV -> OOF -> TO)...")
+    print(f"Starting Pipeline (Translation={not skip_translation})...")
     print(f"Intermediate DataFrames will be saved to: {output_dir}")
 
     optimal_t = run_stage1_pipeline(
-        train_df, engine, n_splits=n_splits, seed=seed, top_k=top_k, output_dir=output_dir
+        train_df,
+        engine,
+        n_splits=n_splits,
+        seed=seed,
+        top_k=top_k,
+        output_dir=output_dir,
+        skip_translation=skip_translation,
     )
 
     print("-" * 30)
     print("PIPELINE COMPLETE")
     print(f"Final Optimal Threshold: {optimal_t:.4f}")
-    print(f"Processed files saved in {output_dir}:")
-    print("  - train_binned.csv")
-    print("  - train_cv.csv")
-    print("  - oof_predictions.csv")
+    if not skip_translation:
+        print(f"Translated file: {output_dir}/train_cv_translated.csv (or .parquet)")
     print("-" * 30)
 
 
