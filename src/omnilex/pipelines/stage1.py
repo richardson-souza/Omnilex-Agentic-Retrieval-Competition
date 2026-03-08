@@ -82,7 +82,9 @@ def run_stage1_pipeline(
         query_col = "query_de"
     elif os.path.exists(os.path.join(output_dir, "train_cv_translated.parquet")):
         print("Loading existing translated queries...")
-        train_df_cv = pd.read_parquet(os.path.join(output_dir, "train_cv_translated.parquet"))
+        train_df_cv = pd.read_parquet(
+            os.path.join(output_dir, "train_cv_translated.parquet")
+        )
         query_col = "query_de"
 
     # Fase 3: Model Architecture (Retrieval Híbrido)

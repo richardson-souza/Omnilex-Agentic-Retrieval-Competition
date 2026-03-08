@@ -2,7 +2,9 @@ import pandas as pd
 import numpy as np
 
 
-def generate_oof_predictions(df: pd.DataFrame, search_engine, top_k: int = 50) -> pd.DataFrame:
+def generate_oof_predictions(
+    df: pd.DataFrame, search_engine, top_k: int = 50
+) -> pd.DataFrame:
     """
     Generate Out-Of-Fold predictions by running the search engine on validation sets.
 

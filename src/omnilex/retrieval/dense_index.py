@@ -11,11 +11,11 @@ from sentence_transformers import SentenceTransformer
 
 
 class DenseIndex:
-    """Dense index for semantic search using FAISS."""
+    """Memory-efficient dense index for large-scale semantic search."""
 
     def __init__(
         self,
-        model_name: str = "paraphrase-multilingual-mpnet-base-v2",
+        model_name: str = "intfloat/multilingual-e5-small",
         documents: Optional[List[Dict[str, Any]]] = None,
         text_field: str = "text",
         citation_field: str = "citation",
@@ -29,31 +29,41 @@ class DenseIndex:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = SentenceTransformer(model_name, device=self.device)
 
-        self.documents: List[Dict[str, Any]] = []
+        # Store ONLY citations to save RAM
+        self.citations: List[str] = []
         self.index: Optional[faiss.Index] = None
 
         if documents:
             self.build(documents)
 
     def build(self, documents: List[Dict[str, Any]], batch_size: int = 32) -> None:
+        """Compatibility method to build from list of dicts."""
         texts = [doc.get(self.text_field, "") for doc in documents]
-        self.build_from_lists(texts, documents, batch_size=batch_size)
+        citations = [doc.get(self.citation_field, "Unknown") for doc in documents]
+        self.build_from_lists(texts, citations, batch_size=batch_size)
 
     def build_from_lists(
-        self, texts: List[str], metadata: List[Dict[str, Any]], batch_size: int = 32
+        self, texts: List[str], citations: List[str], batch_size: int = 128
     ) -> None:
-        """Memory-efficient build from separate lists."""
-        self.documents = metadata
+        """Build FAISS index from texts and store corresponding citations."""
+        self.citations = citations
 
-        print(f"Generating embeddings for {len(texts)} documents using {self.model_name}...")
+        print(
+            f"Generating embeddings for {len(texts)} documents using {self.model_name}..."
+        )
         embeddings = self.model.encode(
-            texts, batch_size=batch_size, show_progress_bar=True, convert_to_numpy=True
+            texts,
+            batch_size=batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
         )
 
         dimension = embeddings.shape[1]
-        faiss.normalize_L2(embeddings)
         self.index = faiss.IndexFlatIP(dimension)
         self.index.add(embeddings)
+
+        print(f"Index built with {self.index.ntotal} vectors.")
 
     def search(
         self,
@@ -61,25 +71,24 @@ class DenseIndex:
         top_k: int = 10,
         return_scores: bool = True,
     ) -> List[Dict[str, Any]]:
+        """Search the index and map results to citations."""
         if self.index is None:
             raise ValueError("Index not built.")
 
-        query_embedding = self.model.encode([query], convert_to_numpy=True)
-        faiss.normalize_L2(query_embedding)
-
+        query_embedding = self.model.encode(
+            [query], convert_to_numpy=True, normalize_embeddings=True
+        )
         scores, indices = self.index.search(query_embedding, top_k)
 
         results = []
         for score, idx in zip(scores[0], indices[0]):
-            if idx == -1:
+            if idx == -1 or idx >= len(self.citations):
                 continue
 
-            doc = self.documents[idx].copy()
+            res = {"citation": self.citations[idx]}
             if return_scores:
-                res_score = float(score)
-                # Map [0, 1] range for RRF compatibility
-                doc["_score"] = res_score
-            results.append(doc)
+                res["_score"] = float(score)
+            results.append(res)
 
         return results
 
@@ -88,7 +97,7 @@ class DenseIndex:
         faiss.write_index(self.index, path_prefix + ".index")
 
         metadata = {
-            "documents": self.documents,
+            "citations": self.citations,
             "model_name": self.model_name,
             "text_field": self.text_field,
             "citation_field": self.citation_field,
@@ -107,6 +116,13 @@ class DenseIndex:
             text_field=metadata["text_field"],
             citation_field=metadata["citation_field"],
         )
-        instance.documents = metadata["documents"]
+        if "citations" in metadata:
+            instance.citations = metadata["citations"]
+        elif "documents" in metadata:
+            instance.citations = [
+                doc.get(instance.citation_field, "Unknown")
+                for doc in metadata["documents"]
+            ]
+
         instance.index = faiss.read_index(path_prefix + ".index")
         return instance

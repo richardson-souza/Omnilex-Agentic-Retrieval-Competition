@@ -30,7 +30,9 @@ def compute_macro_f1(true_citations_list, pred_citations_list):
     return np.mean(f1_scores) if f1_scores else 0.0
 
 
-def optimize_threshold(oof_df: pd.DataFrame, train_df: pd.DataFrame, verbose: bool = False):
+def optimize_threshold(
+    oof_df: pd.DataFrame, train_df: pd.DataFrame, verbose: bool = False
+):
     """
     Perform Grid Search to find the optimal threshold for Macro F1.
     """

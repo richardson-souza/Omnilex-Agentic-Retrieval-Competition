@@ -39,7 +39,9 @@ def load_translation_model(model_name: str = "facebook/nllb-200-distilled-600M")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     # Load on CPU (FP32)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name, low_cpu_mem_usage=True).to(device)
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        model_name, low_cpu_mem_usage=True
+    ).to(device)
 
     model.eval()
     return tokenizer, model, device
@@ -66,14 +68,23 @@ def batch_translate(
     with inference_ctx:
         for batch in tqdm(dataloader, desc=f"Translating to {target_lang} (CPU)"):
             inputs = tokenizer(
-                batch, return_tensors="pt", padding=True, truncation=True, max_length=128
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=128,
             ).to(device)
 
             generated_tokens = model.generate(
-                **inputs, forced_bos_token_id=forced_bos_token_id, max_length=128, num_beams=1
+                **inputs,
+                forced_bos_token_id=forced_bos_token_id,
+                max_length=128,
+                num_beams=1,
             )
 
-            decoded_batch = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+            decoded_batch = tokenizer.batch_decode(
+                generated_tokens, skip_special_tokens=True
+            )
             translated_queries.extend(decoded_batch)
 
             # GC nonetheless
@@ -101,7 +112,12 @@ def apply_translation_pipeline(
 
     print(f"Iniciando Tradução para {target_lang}...")
     queries_translated = batch_translate(
-        queries_en, tokenizer, model, device, target_lang=target_lang, batch_size=batch_size
+        queries_en,
+        tokenizer,
+        model,
+        device,
+        target_lang=target_lang,
+        batch_size=batch_size,
     )
 
     del model
