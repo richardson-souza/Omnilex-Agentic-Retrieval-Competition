@@ -2,11 +2,12 @@
 
 import pickle
 import json
+import os
 import numpy as np
 import scipy.sparse as sp
 from sklearn.feature_extraction.text import CountVectorizer
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 
 
 class BM25Index:
@@ -25,9 +26,7 @@ class BM25Index:
         self.text_field = text_field
         self.citation_field = citation_field
 
-        self.vectorizer = CountVectorizer(
-            lowercase=True, token_pattern=r"(?u)\b\w\w+\b"
-        )
+        self.vectorizer = CountVectorizer(lowercase=True, token_pattern=r"(?u)\b\w\w+\b")
         self.citations: List[str] = []
         self.tf_matrix: Optional[sp.csr_matrix] = None
         self.doc_lens: Optional[np.ndarray] = None
@@ -74,13 +73,10 @@ class BM25Index:
             return []
 
         q_indices = query_vec.indices
-        # Use only the columns present in the query to save memory during search
         tf = self.tf_matrix[:, q_indices].toarray()
 
         num = tf * (self.k1 + 1)
-        denom = tf + self.k1 * (
-            1 - self.b + self.b * self.doc_lens[:, None] / self.avgdl
-        )
+        denom = tf + self.k1 * (1 - self.b + self.b * self.doc_lens[:, None] / self.avgdl)
 
         scores = (self.idf[q_indices] * (num / denom)).sum(axis=1)
         top_indices = np.argsort(scores)[-top_k:][::-1]
@@ -114,20 +110,43 @@ class BM25Index:
                 f,
             )
 
-    @classmethod
-    def load(cls, path: Path | str) -> "BM25Index":
+    def load(self, path: Union[str, Path]):
+        """
+        Desserializa o estado salvo no disco e o injeta diretamente na instância atual.
+        """
+        path = str(path)
+        if os.path.isdir(path):
+            path = os.path.join(path, "corpus_bm25.pkl")
+
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"[X] Arquivo de índice não encontrado: {path}")
+
         with open(path, "rb") as f:
-            data = pickle.load(f)
-        instance = cls(
-            citation_field=data["citation_field"],
-            text_field=data.get("text_field", "text"),
-        )
-        instance.citations = data["citations"]
-        instance.tf_matrix = data["tf_matrix"]
-        instance.doc_lens = data["doc_lens"]
-        instance.avgdl = data["avgdl"]
-        instance.idf = data["idf"]
-        instance.vectorizer = data["vectorizer"]
+            state_dict = pickle.load(f)
+
+        # Injeta todas as chaves do dicionário (ex: 'tf_matrix', 'vectorizer')
+        # como atributos reais desta instância (self)
+        self.__dict__.update(state_dict)
+
+        # Validação estrutural de segurança (Fail-Fast)
+        if not hasattr(self, "tf_matrix") or self.tf_matrix is None:
+            # Fallback de compatibilidade caso você tenha salvo a chave com outro nome
+            if "matrix" in state_dict:
+                self.tf_matrix = state_dict["matrix"]
+            elif "bm25_matrix" in state_dict:
+                self.tf_matrix = state_dict["bm25_matrix"]
+            else:
+                raise KeyError(
+                    f"[X] Erro de desserialização: 'tf_matrix' ausente. Chaves no disco: {list(state_dict.keys())}"
+                )
+
+        print(f"[V] BM25 Index montado com sucesso! Shape da tf_matrix: {self.tf_matrix.shape}")
+
+    @classmethod
+    def load_from_path(cls, path: Path | str) -> "BM25Index":
+        """Convenience method to create a new instance and load data."""
+        instance = cls()
+        instance.load(path)
         return instance
 
 
@@ -139,9 +158,7 @@ def build_index(
     text_field: str = "text",
     citation_field: str = "citation",
 ) -> BM25Index:
-    return BM25Index(
-        documents=documents, text_field=text_field, citation_field=citation_field
-    )
+    return BM25Index(documents=documents, text_field=text_field, citation_field=citation_field)
 
 
 def search(index: BM25Index, query: str, top_k: int = 10) -> List[Dict[str, Any]]:

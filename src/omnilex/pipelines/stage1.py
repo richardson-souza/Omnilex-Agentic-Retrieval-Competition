@@ -85,7 +85,9 @@ def run_stage1_pipeline(
 
         # 1. Load First-Stage Indices
         print("  Loading BM25 index...")
-        bm25_idx = BM25Index.load(bm25_path)
+        bm25_idx = BM25Index()  # New signature: instantiate first
+        bm25_idx.load(bm25_path)  # Then load
+
         print("  Loading Dense index...")
         dense_idx = DenseIndex.load(dense_prefix)
 
@@ -105,10 +107,7 @@ def run_stage1_pipeline(
             text_lookup = build_text_lookup(laws_path, courts_path)
 
         search_engine = HybridSearchEngine(
-            bm25_index=bm25_idx,
-            dense_index=dense_idx,
-            reranker=reranker,
-            text_lookup=text_lookup,
+            bm25_index=bm25_idx, dense_index=dense_idx, reranker=reranker, text_lookup=text_lookup
         )
 
     # Fase 3B & 4B: Inferência OOF
@@ -117,8 +116,6 @@ def run_stage1_pipeline(
     if query_col != "query":
         df_for_oof["query"] = df_for_oof[query_col]
 
-    # Note: top_k_rerank can be passed via kwargs or modified in generate_oof_predictions
-    # For now, we assume generate_oof_predictions calls search_engine.query()
     oof_df = generate_oof_predictions(df_for_oof, search_engine, top_k=top_k)
     save_df(oof_df, "oof_predictions")
 
