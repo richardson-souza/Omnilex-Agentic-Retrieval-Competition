@@ -17,9 +17,9 @@ class SQLiteTextLookup:
         self._ensure_table()
 
     def _ensure_table(self):
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS documents (citation TEXT PRIMARY KEY, text TEXT)"
-        )
+        # REMOVED PRIMARY KEY to handle duplicates gracefully during massive streaming.
+        # We will use an INDEX for performance instead.
+        self.conn.execute("CREATE TABLE IF NOT EXISTS documents (citation TEXT, text TEXT)")
 
     def insert_chunk(self, df: pd.DataFrame):
         """Insert a dataframe chunk into SQLite."""
@@ -27,14 +27,24 @@ class SQLiteTextLookup:
         self.conn.commit()
 
     def create_index(self):
-        """Build index for O(1) retrieval."""
+        """Build index for O(1) retrieval and optionally cleanup duplicates."""
+        print("  Cleaning up duplicate citations from disk...")
+        # Optional: remove duplicates to save space, keeping only the first entry found
+        self.conn.execute(
+            "DELETE FROM documents WHERE rowid NOT IN (SELECT min(rowid) FROM documents GROUP BY citation)"
+        )
+        self.conn.commit()
+
         print("  Building SQLite index on citation...")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_citation ON documents (citation)")
         self.conn.commit()
 
     def get(self, citation: str) -> Optional[str]:
         """Fetch text for a single citation from disk."""
-        cursor = self.conn.execute("SELECT text FROM documents WHERE citation = ?", (citation,))
+        # Because we created an index, this lookup is O(1)
+        cursor = self.conn.execute(
+            "SELECT text FROM documents WHERE citation = ? LIMIT 1", (citation,)
+        )
         row = cursor.fetchone()
         return row[0] if row else None
 
@@ -49,8 +59,8 @@ def build_text_lookup(
     ULTRA-MEMORY-EFFICIENT LOOKUP: Creates a SQLite database from CSVs.
     Uses chunking to keep RAM usage near zero during build.
     """
-    # Clean old DB if exists
     if os.path.exists(db_path):
+        print(f"Removing existing database at {db_path}...")
         os.remove(db_path)
 
     lookup = SQLiteTextLookup(db_path)
@@ -58,17 +68,17 @@ def build_text_lookup(
     # Process files in chunks to avoid OOM
     for path in [laws_path, courts_path]:
         if not os.path.exists(path):
+            print(f"  Warning: {path} not found. Skipping...")
             continue
 
         print(f"Streaming {path} to SQLite...")
-        # Use a small chunksize (100k) to stay within RAM limits
         for chunk in pd.read_csv(path, usecols=["citation", "text"], chunksize=100000):
-            # Remove duplicates if any in the chunk to avoid PRIMARY KEY constraint fail
-            chunk = chunk.drop_duplicates(subset=["citation"])
-            # Only keep rows not already in DB (simple way: try/except or filter)
-            # For simplicity, we drop duplicates from the file first if possible,
-            # or use 'INSERT OR IGNORE' logic
-            chunk.to_sql("documents", lookup.conn, if_exists="append", index=False, method="multi")
+            # Pre-deduplicate inside chunk to save I/O and disk space
+            chunk = chunk.drop_duplicates(subset=["citation"], keep="first")
+
+            # Insert into SQLite without worrying about PRIMARY KEY collisions
+            lookup.insert_chunk(chunk)
+
             del chunk
             gc.collect()
 
