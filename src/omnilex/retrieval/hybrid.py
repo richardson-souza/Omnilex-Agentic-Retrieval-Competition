@@ -17,8 +17,6 @@ class SQLiteTextLookup:
         self._ensure_table()
 
     def _ensure_table(self):
-        # REMOVED PRIMARY KEY to handle duplicates gracefully during massive streaming.
-        # We will use an INDEX for performance instead.
         self.conn.execute("CREATE TABLE IF NOT EXISTS documents (citation TEXT, text TEXT)")
 
     def insert_chunk(self, df: pd.DataFrame):
@@ -29,7 +27,6 @@ class SQLiteTextLookup:
     def create_index(self):
         """Build index for O(1) retrieval and optionally cleanup duplicates."""
         print("  Cleaning up duplicate citations from disk...")
-        # Optional: remove duplicates to save space, keeping only the first entry found
         self.conn.execute(
             "DELETE FROM documents WHERE rowid NOT IN (SELECT min(rowid) FROM documents GROUP BY citation)"
         )
@@ -41,7 +38,6 @@ class SQLiteTextLookup:
 
     def get(self, citation: str) -> Optional[str]:
         """Fetch text for a single citation from disk."""
-        # Because we created an index, this lookup is O(1)
         cursor = self.conn.execute(
             "SELECT text FROM documents WHERE citation = ? LIMIT 1", (citation,)
         )
@@ -65,7 +61,6 @@ def build_text_lookup(
 
     lookup = SQLiteTextLookup(db_path)
 
-    # Process files in chunks to avoid OOM
     for path in [laws_path, courts_path]:
         if not os.path.exists(path):
             print(f"  Warning: {path} not found. Skipping...")
@@ -73,16 +68,14 @@ def build_text_lookup(
 
         print(f"Streaming {path} to SQLite...")
         for chunk in pd.read_csv(path, usecols=["citation", "text"], chunksize=100000):
-            # Pre-deduplicate inside chunk to save I/O and disk space
             chunk = chunk.drop_duplicates(subset=["citation"], keep="first")
-
-            # Insert into SQLite without worrying about PRIMARY KEY collisions
             lookup.insert_chunk(chunk)
-
             del chunk
             gc.collect()
 
     lookup.create_index()
+    # Final cleanup
+    gc.collect()
     return lookup
 
 
@@ -133,6 +126,9 @@ class HybridSearchEngine:
 
         sorted_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
+        # Cleanup first stage temp data
+        del rrf_scores, bm25_results, dense_results
+
         if not self.reranker or not self.text_lookup or not sorted_rrf:
             return self._normalize_results(sorted_rrf[:top_k])
 
@@ -142,7 +138,6 @@ class HybridSearchEngine:
         valid_citations = []
 
         for citation, _ in candidates_to_rerank:
-            # Handle both DataFrame and SQLite lookup
             if isinstance(self.text_lookup, pd.DataFrame):
                 try:
                     doc_text = self.text_lookup.at[citation, "text"]
@@ -160,11 +155,19 @@ class HybridSearchEngine:
         if not cross_inp:
             return self._normalize_results(sorted_rrf[:top_k])
 
-        # Batch prediction
-        logits = self.reranker.predict(cross_inp)
+        # Batch prediction with explicit batch_size to control RAM/VRAM
+        import torch
+
+        with torch.inference_mode():
+            logits = self.reranker.predict(cross_inp, batch_size=16, show_progress_bar=False)
+
         probabilities = 1.0 / (1.0 + np.exp(-logits))
 
         final_ranked = sorted(zip(valid_citations, probabilities), key=lambda x: x[1], reverse=True)
+
+        # Explicit cleanup of cross-encoder pairs
+        del cross_inp, logits, candidates_to_rerank
+
         return [{"citation": cit, "score": float(prob)} for cit, prob in final_ranked[:top_k]]
 
     def _normalize_results(self, results: List[tuple]) -> List[Dict[str, Any]]:
