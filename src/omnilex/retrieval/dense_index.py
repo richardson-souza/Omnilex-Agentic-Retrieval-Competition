@@ -36,18 +36,11 @@ class DenseIndex:
         if documents:
             self.build(documents)
 
-    def build(
-        self,
-        documents: List[Dict[str, Any]],
-        batch_size: int = 32,
-        multi_gpu: bool = False,
-    ) -> None:
+    def build(self, documents: List[Dict[str, Any]], batch_size: int = 32) -> None:
         """Compatibility method to build from list of dicts."""
         texts = [doc.get(self.text_field, "") for doc in documents]
         citations = [doc.get(self.citation_field, "Unknown") for doc in documents]
-        self.build_from_lists(
-            texts, citations, batch_size=batch_size, multi_gpu=multi_gpu
-        )
+        self.build_from_lists(texts, citations, batch_size=batch_size)
 
     def build_from_lists(
         self,
@@ -56,15 +49,10 @@ class DenseIndex:
         batch_size: int = 128,
         multi_gpu: bool = False,
     ) -> None:
-        """
-        Build FAISS index from texts and store corresponding citations.
-        Supports multi-GPU processing for accelerated indexing.
-        """
+        """Build FAISS index from texts and store corresponding citations."""
         self.citations = citations
 
-        print(
-            f"Generating embeddings for {len(texts)} documents using {self.model_name}..."
-        )
+        print(f"Generating embeddings for {len(texts)} documents using {self.model_name}...")
 
         if multi_gpu:
             print("  Using multi-process multi-GPU pool...")
@@ -86,9 +74,7 @@ class DenseIndex:
         self.index = faiss.IndexFlatIP(dimension)
         self.index.add(embeddings)
 
-        print(
-            f"Index built with {self.index.ntotal} vectors and {len(self.citations)} metadata entries."
-        )
+        print(f"Index built with {self.index.ntotal} vectors.")
 
     def search(
         self,
@@ -125,7 +111,7 @@ class DenseIndex:
         print(f"Saving FAISS index to {path_prefix}.index...")
         faiss.write_index(self.index, path_prefix + ".index")
 
-        # Save ONLY citations and metadata
+        # Save metadata
         print(f"Saving metadata to {path_prefix}.pkl...")
         metadata = {
             "citations": self.citations,
@@ -138,24 +124,39 @@ class DenseIndex:
 
     @classmethod
     def load(cls, path_prefix: Path | str) -> "DenseIndex":
-        """Load FAISS index and citations list."""
+        """Load FAISS index and citations list with fallback for different formats."""
         path_prefix = str(path_prefix)
 
-        with open(path_prefix + ".pkl", "rb") as f:
-            metadata = pickle.load(f)
+        pkl_path = path_prefix + ".pkl"
+        print(f"Loading metadata from {pkl_path}...")
+        with open(pkl_path, "rb") as f:
+            data = pickle.load(f)
+
+        # Handle various serialization formats
+        if isinstance(data, dict):
+            model_name = data.get("model_name", "intfloat/multilingual-e5-small")
+            text_field = data.get("text_field", "text")
+            citation_field = data.get("citation_field", "citation")
+            citations = data.get("citations", [])
+            if not citations and "documents" in data:
+                citations = [doc.get(citation_field, "Unknown") for doc in data["documents"]]
+        else:
+            # Fallback for when the .pkl is just a list of strings
+            print("  Warning: metadata is a raw list, using default model parameters.")
+            model_name = "intfloat/multilingual-e5-small"
+            text_field = "text"
+            citation_field = "citation"
+            citations = data
 
         instance = cls(
-            model_name=metadata["model_name"],
-            text_field=metadata["text_field"],
-            citation_field=metadata["citation_field"],
+            model_name=model_name,
+            text_field=text_field,
+            citation_field=citation_field,
         )
-        if "citations" in metadata:
-            instance.citations = metadata["citations"]
-        elif "documents" in metadata:
-            instance.citations = [
-                doc.get(instance.citation_field, "Unknown")
-                for doc in metadata["documents"]
-            ]
+        instance.citations = citations
 
-        instance.index = faiss.read_index(path_prefix + ".index")
+        index_path = path_prefix + ".index"
+        print(f"Loading FAISS index from {index_path}...")
+        instance.index = faiss.read_index(index_path)
+
         return instance
