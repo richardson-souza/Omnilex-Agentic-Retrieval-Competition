@@ -6,28 +6,33 @@ import numpy as np
 from typing import List, Dict, Any, Optional, Union
 
 
-def build_text_lookup(laws_path: str, courts_path: str) -> Dict[str, str]:
+def build_text_lookup(laws_path: str, courts_path: str) -> pd.DataFrame:
     """
-    LAZY LOADING O(1): Builds a mapping from citation to document text.
-    Maintains only the IDs and texts in RAM (~2GB for full corpus).
+    MEMORY-EFFICIENT LAZY LOADING: Builds a lookup table using a indexed DataFrame.
+    Using df.loc[] is O(1) and avoids the massive overhead of Python dictionaries
+    on large-scale corpora (2.6M+ entries).
     """
-    lookups = {}
+    dfs = []
 
     if os.path.exists(laws_path):
-        print(f"Building text lookup from {laws_path}...")
-        df_laws = pd.read_csv(laws_path, usecols=["citation", "text"])
-        lookups.update(df_laws.set_index("citation")["text"].to_dict())
-        del df_laws
+        print(f"Loading laws from {laws_path} for lookup...")
+        dfs.append(pd.read_csv(laws_path, usecols=["citation", "text"]))
 
     if os.path.exists(courts_path):
-        print(f"Building text lookup from {courts_path}...")
-        # Court considerations is very large (2.4GB), we use chunks if needed,
-        # but here we follow the req_10 suggestion.
-        df_courts = pd.read_csv(courts_path, usecols=["citation", "text"])
-        lookups.update(df_courts.set_index("citation")["text"].to_dict())
-        del df_courts
+        print(f"Loading courts from {courts_path} for lookup...")
+        dfs.append(pd.read_csv(courts_path, usecols=["citation", "text"]))
 
-    return lookups
+    if not dfs:
+        return pd.DataFrame(columns=["text"])
+
+    df_corpus = pd.concat(dfs, ignore_index=True)
+    print(f"Indexing {len(df_corpus)} documents...")
+    df_corpus.set_index("citation", inplace=True)
+
+    # Sort index for even faster .loc access
+    df_corpus.sort_index(inplace=True)
+
+    return df_corpus
 
 
 class HybridSearchEngine:
@@ -38,7 +43,7 @@ class HybridSearchEngine:
         bm25_index,
         dense_index,
         reranker=None,
-        text_lookup: Optional[Dict[str, str]] = None,
+        text_lookup: Optional[pd.DataFrame] = None,
         rrf_k: int = 60,
     ):
         """
@@ -48,13 +53,13 @@ class HybridSearchEngine:
             bm25_index: Instance of BM25Index
             dense_index: Instance of DenseIndex
             reranker: Instance of sentence_transformers.CrossEncoder
-            text_lookup: Dictionary mapping citation -> text for reranking
+            text_lookup: pd.DataFrame with 'citation' as index and 'text' column
             rrf_k: Stability parameter for RRF (default 60)
         """
         self.bm25_index = bm25_index
         self.dense_index = dense_index
         self.reranker = reranker
-        self.text_lookup = text_lookup or {}
+        self.text_lookup = text_lookup
         self.rrf_k = rrf_k
 
     def query(
@@ -95,8 +100,8 @@ class HybridSearchEngine:
         # Sort by RRF score
         sorted_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
-        # If no reranker or no candidates, return RRF results normalized
-        if not self.reranker or not sorted_rrf:
+        # If no reranker or no lookup, return RRF results normalized
+        if self.reranker is None or self.text_lookup is None or not sorted_rrf:
             return self._normalize_results(sorted_rrf[:top_k])
 
         # 3. Second-Stage Retrieval (Cross-Encoder Reranking)
@@ -106,11 +111,18 @@ class HybridSearchEngine:
         valid_citations = []
 
         for citation, _ in candidates_to_rerank:
-            # Lazy Loading check
-            doc_text = self.text_lookup.get(citation)
-            if doc_text:
-                cross_inp.append([text, doc_text])
-                valid_citations.append(citation)
+            # Memory-efficient lookup using DataFrame index
+            try:
+                # Use .at for faster single value access or .loc
+                doc_text = self.text_lookup.at[citation, "text"]
+                if isinstance(doc_text, pd.Series):  # Handle potential duplicate citations
+                    doc_text = doc_text.iloc[0]
+
+                if pd.notna(doc_text):
+                    cross_inp.append([text, str(doc_text)])
+                    valid_citations.append(citation)
+            except KeyError:
+                continue
 
         if not cross_inp:
             return self._normalize_results(sorted_rrf[:top_k])
@@ -118,7 +130,7 @@ class HybridSearchEngine:
         # Prediction (Logits)
         logits = self.reranker.predict(cross_inp)
 
-        # Sigmoid conversion for strict [0.0, 1.0] probabilities
+        # Sigmoid conversion for probabilities [0.0, 1.0]
         probabilities = 1.0 / (1.0 + np.exp(-logits))
 
         # Final Rank by probability
