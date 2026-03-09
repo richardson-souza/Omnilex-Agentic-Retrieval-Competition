@@ -44,10 +44,14 @@ def load_corpus_in_chunks(
 
 
 def build_hybrid_index(
-    input_dir: Path, output_dir: Path, model_name: str, limit: int = None
+    input_dir: Path,
+    output_dir: Path,
+    model_name: str,
+    limit: int = None,
+    multi_gpu: bool = False,
 ) -> None:
     """Build both BM25 and Dense indices using memory-efficient streaming."""
-    print("Building hybrid index for LARGE-SCALE corpus (CORRECTED FLOW)...")
+    print(f"Building hybrid index for LARGE-SCALE corpus (Multi-GPU={multi_gpu})...")
 
     all_texts = []
     all_citations = []
@@ -92,7 +96,7 @@ def build_hybrid_index(
     bm25_idx.save(bm25_path)
     print(f"  BM25 Index saved to {bm25_path}")
 
-    # Clear BM25 from RAM to make room for Dense Indexing
+    # Clear BM25 from RAM
     del bm25_idx
     gc.collect()
 
@@ -100,9 +104,10 @@ def build_hybrid_index(
     print("  Step 2: Building Dense Index (FAISS)...")
     dense_idx = DenseIndex(model_name=model_name)
 
-    # Corrected Flow: Pass full lists and let DenseIndex handle the batching/accumulation
-    # Metadata list is now just strings (citations) which is much more RAM-efficient
-    dense_idx.build_from_lists(all_texts, all_citations, batch_size=128)
+    # Pass full lists and let DenseIndex handle multi-GPU and metadata accumulation
+    dense_idx.build_from_lists(
+        all_texts, all_citations, batch_size=128, multi_gpu=multi_gpu
+    )
 
     dense_prefix = output_dir / "corpus_dense"
     dense_idx.save(dense_prefix)
@@ -128,11 +133,16 @@ def main():
         "--model-name", type=str, default="intfloat/multilingual-e5-small"
     )
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--multi-gpu", action="store_true", help="Enable multi-GPU encoding"
+    )
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    build_hybrid_index(args.input_dir, args.output_dir, args.model_name, args.limit)
+    build_hybrid_index(
+        args.input_dir, args.output_dir, args.model_name, args.limit, args.multi_gpu
+    )
     print("\nHybrid index building complete!")
 
 

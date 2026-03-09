@@ -36,34 +36,59 @@ class DenseIndex:
         if documents:
             self.build(documents)
 
-    def build(self, documents: List[Dict[str, Any]], batch_size: int = 32) -> None:
+    def build(
+        self,
+        documents: List[Dict[str, Any]],
+        batch_size: int = 32,
+        multi_gpu: bool = False,
+    ) -> None:
         """Compatibility method to build from list of dicts."""
         texts = [doc.get(self.text_field, "") for doc in documents]
         citations = [doc.get(self.citation_field, "Unknown") for doc in documents]
-        self.build_from_lists(texts, citations, batch_size=batch_size)
+        self.build_from_lists(
+            texts, citations, batch_size=batch_size, multi_gpu=multi_gpu
+        )
 
     def build_from_lists(
-        self, texts: List[str], citations: List[str], batch_size: int = 128
+        self,
+        texts: List[str],
+        citations: List[str],
+        batch_size: int = 128,
+        multi_gpu: bool = False,
     ) -> None:
-        """Build FAISS index from texts and store corresponding citations."""
+        """
+        Build FAISS index from texts and store corresponding citations.
+        Supports multi-GPU processing for accelerated indexing.
+        """
         self.citations = citations
 
         print(
             f"Generating embeddings for {len(texts)} documents using {self.model_name}..."
         )
-        embeddings = self.model.encode(
-            texts,
-            batch_size=batch_size,
-            show_progress_bar=True,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-        )
+
+        if multi_gpu:
+            print("  Using multi-process multi-GPU pool...")
+            pool = self.model.start_multi_process_pool()
+            embeddings = self.model.encode_multi_process(
+                texts, pool, batch_size=batch_size, normalize_embeddings=True
+            )
+            self.model.stop_multi_process_pool(pool)
+        else:
+            embeddings = self.model.encode(
+                texts,
+                batch_size=batch_size,
+                show_progress_bar=True,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+            )
 
         dimension = embeddings.shape[1]
         self.index = faiss.IndexFlatIP(dimension)
         self.index.add(embeddings)
 
-        print(f"Index built with {self.index.ntotal} vectors.")
+        print(
+            f"Index built with {self.index.ntotal} vectors and {len(self.citations)} metadata entries."
+        )
 
     def search(
         self,
@@ -93,9 +118,15 @@ class DenseIndex:
         return results
 
     def save(self, path_prefix: Path | str) -> None:
+        """Save FAISS index and citations list separately."""
         path_prefix = str(path_prefix)
+
+        # Save FAISS index (atomic)
+        print(f"Saving FAISS index to {path_prefix}.index...")
         faiss.write_index(self.index, path_prefix + ".index")
 
+        # Save ONLY citations and metadata
+        print(f"Saving metadata to {path_prefix}.pkl...")
         metadata = {
             "citations": self.citations,
             "model_name": self.model_name,
@@ -107,7 +138,9 @@ class DenseIndex:
 
     @classmethod
     def load(cls, path_prefix: Path | str) -> "DenseIndex":
+        """Load FAISS index and citations list."""
         path_prefix = str(path_prefix)
+
         with open(path_prefix + ".pkl", "rb") as f:
             metadata = pickle.load(f)
 
