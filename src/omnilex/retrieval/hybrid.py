@@ -3,6 +3,7 @@
 import os
 import sqlite3
 import gc
+import time
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Any, Optional, Union
@@ -25,15 +26,22 @@ class SQLiteTextLookup:
         self.conn.commit()
 
     def create_index(self):
-        """Build index for O(1) retrieval and optionally cleanup duplicates."""
-        print("  Cleaning up duplicate citations from disk...")
+        """Build index for O(1) retrieval and cleanup duplicates."""
+        print("  Cleaning up duplicate citations from disk (Final Stage)...")
+        # Keep only the first rowid for each citation
         self.conn.execute(
             "DELETE FROM documents WHERE rowid NOT IN (SELECT min(rowid) FROM documents GROUP BY citation)"
         )
         self.conn.commit()
 
-        print("  Building SQLite index on citation...")
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_citation ON documents (citation)")
+        print("  Building UNIQUE SQLite index on citation...")
+        # Making it UNIQUE ensures maximum B-Tree search speed
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_citation ON documents (citation)")
+        self.conn.commit()
+
+        # Shrink file size
+        print("  Vacuuming database...")
+        self.conn.execute("VACUUM")
         self.conn.commit()
 
     def get(self, citation: str) -> Optional[str]:
@@ -68,13 +76,13 @@ def build_text_lookup(
 
         print(f"Streaming {path} to SQLite...")
         for chunk in pd.read_csv(path, usecols=["citation", "text"], chunksize=100000):
+            # Pre-deduplicate inside chunk to save disk I/O
             chunk = chunk.drop_duplicates(subset=["citation"], keep="first")
             lookup.insert_chunk(chunk)
             del chunk
             gc.collect()
 
     lookup.create_index()
-    # Final cleanup
     gc.collect()
     return lookup
 
@@ -104,6 +112,8 @@ class HybridSearchEngine:
         dense_top_k: int = 100,
         top_k_rerank: int = 50,
     ) -> List[Dict[str, Any]]:
+        start_time = time.time()
+
         # 1. First-Stage Retrieval (BM25 + FAISS)
         bm25_results = self.bm25_index.search(text, top_k=bm25_top_k)
         dense_results = self.dense_index.search(text, top_k=dense_top_k)
@@ -126,7 +136,7 @@ class HybridSearchEngine:
 
         sorted_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
-        # Cleanup first stage temp data
+        # Cleanup first stage
         del rrf_scores, bm25_results, dense_results
 
         if not self.reranker or not self.text_lookup or not sorted_rrf:
@@ -155,7 +165,7 @@ class HybridSearchEngine:
         if not cross_inp:
             return self._normalize_results(sorted_rrf[:top_k])
 
-        # Batch prediction with explicit batch_size to control RAM/VRAM
+        # Batch prediction with explicit batch_size
         import torch
 
         with torch.inference_mode():
@@ -165,8 +175,12 @@ class HybridSearchEngine:
 
         final_ranked = sorted(zip(valid_citations, probabilities), key=lambda x: x[1], reverse=True)
 
-        # Explicit cleanup of cross-encoder pairs
+        # Cleanup
         del cross_inp, logits, candidates_to_rerank
+
+        # Optional Telemetry
+        # duration = time.time() - start_time
+        # if np.random.random() < 0.01: print(f"Query latency: {duration:.2f}s")
 
         return [{"citation": cit, "score": float(prob)} for cit, prob in final_ranked[:top_k]]
 

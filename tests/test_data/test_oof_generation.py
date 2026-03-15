@@ -81,3 +81,44 @@ def test_generate_oof_predictions_min_max_scaling():
     assert max(scores) == 1.0
     assert min(scores) == 0.0
     assert 0.5 in scores # (15-10)/(20-10) = 0.5
+
+def test_generate_oof_predictions_with_bm25_dtype():
+    """Test OOF generation with real BM25Index to ensure no UFuncTypeError."""
+    from omnilex.retrieval.bm25_index import BM25Index
+    
+    data = {
+        'query_id': ['q1', 'q2'],
+        'query': ['apple', 'banana'],
+        'fold': [0, 1]
+    }
+    df = pd.DataFrame(data)
+    
+    docs = [
+        {'citation': 'A1', 'text': 'apple fruit'},
+        {'citation': 'B1', 'text': 'banana fruit'},
+        {'citation': 'F1', 'text': 'fruit'}
+    ]
+    bm25 = BM25Index(documents=docs)
+    
+    # We need to wrap it because generate_oof_predictions calls .query
+    class SearchWrapper:
+        def __init__(self, engine):
+            self.engine = engine
+        def query(self, text, top_k=50):
+            # BM25Index.search returns results with '_score' but oof_generation expects 'score'
+            # Wait, let's check what oof_generation expects.
+            # It expects 'score' if it uses candidates[i]['score']
+            results = self.engine.search(text, top_k=top_k)
+            for r in results:
+                if '_score' in r:
+                    r['score'] = r.pop('_score')
+            return results
+
+    wrapper = SearchWrapper(bm25)
+    
+    # Act: This should NOT raise UFuncTypeError
+    oof_df = generate_oof_predictions(df, wrapper, top_k=10)
+    
+    # Assert
+    assert isinstance(oof_df, pd.DataFrame)
+    assert len(oof_df) > 0
